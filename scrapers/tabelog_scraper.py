@@ -110,24 +110,23 @@ class TabelogScraper(BaseScraper):
         if not url.startswith("http"):
             url = BASE + url
 
-        # ジャンル: ".list-rst__area-genre" は "駅名 距離 / ジャンル" 形式
-        genre_tag = card.select_one("p.list-rst__area-genre")
+        # ジャンル: "div.list-rst__area-genre" は "駅名 距離 / ジャンル" 形式
+        genre_tag = card.select_one("div.list-rst__area-genre")
         if genre_tag:
             raw = genre_tag.get_text(" ", strip=True)
-            # " / " で分割して後半部分をジャンルとして取得
-            if " / " in raw:
-                genre = raw.split(" / ", 1)[1].strip()
-            else:
-                genre = raw
+            genre = raw.split(" / ", 1)[1].strip() if " / " in raw else raw
         else:
             genre = ""
 
-        # 予算（ディナー）: ".c-rating-v3__time--dinner .c-rating-v3__val"
-        dinner_block = card.select_one(".c-rating-v3__time--dinner")
-        if dinner_block:
-            budget_tag = dinner_block.select_one(".c-rating-v3__val")
+        # 予算（ディナー）:
+        # <i class="c-rating-v3__time--dinner"> と <span class="c-rating-v3__val"> は兄弟要素
+        # → <i>タグの親<li>から span を取得する
+        dinner_icon = card.select_one("i.c-rating-v3__time--dinner")
+        if dinner_icon:
+            dinner_li = dinner_icon.find_parent("li")
+            budget_tag = dinner_li.select_one("span.c-rating-v3__val") if dinner_li else None
         else:
-            budget_tag = card.select_one(".c-rating-v3__val")
+            budget_tag = card.select_one("span.c-rating-v3__val")
         budget_text = budget_tag.get_text(strip=True) if budget_tag else ""
         budget = self._parse_budget(budget_text)
 
