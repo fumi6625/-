@@ -2,7 +2,7 @@
 ホットペッパーグルメ スクレイパー
 
 requests + BeautifulSoup を使用。
-駅のエリアコード（SA23/Y***）でエリア検索 → 一覧取得。
+URL形式: https://www.hotpepper.jp/{area_code}/lst/  (例: SA23/Y300/lst/)
 """
 import re
 import logging
@@ -18,6 +18,7 @@ from utils.http import make_session, get_with_retry, rotate_ua
 logger = logging.getLogger(__name__)
 
 BASE = "https://www.hotpepper.jp"
+ITEMS_PER_PAGE = 20
 
 
 class HotPepperScraper(BaseScraper):
@@ -31,10 +32,6 @@ class HotPepperScraper(BaseScraper):
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         })
 
-    # ──────────────────────────────────────────
-    # Public interface
-    # ──────────────────────────────────────────
-
     def search(self, station_name: str, lat: float, lon: float) -> list[Restaurant]:
         results: list[Restaurant] = []
 
@@ -46,11 +43,11 @@ class HotPepperScraper(BaseScraper):
         max_pages = 2 if self.dry_run else 50
 
         for page in range(1, max_pages + 1):
-            soup, final_url = self._fetch_search_page(area_code, page)
+            soup = self._fetch_page(area_code, page)
             if soup is None:
                 break
 
-            cards = self._find_cards(soup)
+            cards = soup.select("div.shopDetailText")
             if not cards:
                 logger.info(f"[ホットペッパー] {station_name}: 結果なし（p{page}）")
                 break
@@ -59,13 +56,9 @@ class HotPepperScraper(BaseScraper):
 
             for card in cards:
                 try:
-                    restaurant = self._parse_card(card, station_name, final_url)
-                    if not restaurant:
-                        continue
-                    # 予算フィルタ（0=未取得は除外しない）
-                    if 0 < restaurant.budget > MAX_BUDGET:
-                        continue
-                    results.append(restaurant)
+                    r = self._parse_card(card, station_name)
+                    if r and (r.budget == 0 or r.budget <= MAX_BUDGET):
+                        results.append(r)
                 except Exception as e:
                     logger.warning(f"[ホットペッパー] カード解析エラー: {e}")
 
@@ -77,98 +70,29 @@ class HotPepperScraper(BaseScraper):
         return results
 
     # ──────────────────────────────────────────
-    # ページ取得
-    # ──────────────────────────────────────────
 
-    def _fetch_search_page(self, area_code: str, page: int):
-        """エリアコードを使って検索ページを取得する"""
-        # page 1 は bgn1 なし、page 2 以降は bgn{(page-1)*20+1}
-        bgn = "" if page == 1 else f"bgn{(page - 1) * 20 + 1}/"
+    def _fetch_page(self, area_code: str, page: int):
+        # page1: /SA23/Y300/lst/  page2: /SA23/Y300/lst/bgn21/  ...
+        bgn = "" if page == 1 else f"bgn{(page - 1) * ITEMS_PER_PAGE + 1}/"
+        url = f"{BASE}/{area_code}/lst/{bgn}"
+        try:
+            resp = get_with_retry(
+                self._session, url,
+                headers={"Referer": f"{BASE}/{area_code}/"},
+                allow_redirects=True,
+            )
+            rotate_ua(self._session)
+            logger.info(f"[ホットペッパー] {url} → {resp.status_code} ({len(resp.text)}文字)")
+            if resp.status_code == 200 and len(resp.text) > 1000:
+                return BeautifulSoup(resp.text, "lxml")
+            return None
+        except Exception as e:
+            logger.warning(f"[ホットペッパー] 取得失敗 {url}: {e}")
+            return None
 
-        urls_to_try = [
-            f"{BASE}/{area_code}/{bgn}",
-            f"{BASE}/{area_code}/bgn{(page-1)*20+1}/",
-        ]
-
-        # 重複除去
-        seen = set()
-        deduped = []
-        for u in urls_to_try:
-            if u not in seen:
-                seen.add(u)
-                deduped.append(u)
-
-        for url in deduped:
-            try:
-                resp = get_with_retry(
-                    self._session, url,
-                    headers={"Referer": BASE + "/"},
-                    allow_redirects=True,
-                )
-                rotate_ua(self._session)
-                logger.debug(f"HP URL試行: {url} → {resp.status_code} ({len(resp.text)}chars) final={resp.url}")
-                if resp.status_code == 200 and len(resp.text) > 1000:
-                    soup = BeautifulSoup(resp.text, "lxml")
-                    # 404ページや空ページを除外
-                    if "存在しません" in resp.text or "not found" in resp.text.lower():
-                        logger.debug(f"HP: 存在しませんページ → スキップ {url}")
-                        continue
-                    cards = self._find_cards(soup)
-                    logger.info(f"[ホットペッパー] {url} → {len(cards)}件のカード")
-                    return soup, resp.url
-                else:
-                    logger.debug(f"HP: 無効レスポンス status={resp.status_code} len={len(resp.text)} → {url}")
-            except Exception as e:
-                logger.info(f"[ホットペッパー] URL試行失敗 {url}: {e}")
-                continue
-
-        logger.warning(f"[ホットペッパー] エリア {area_code} p{page}: 取得失敗")
-        return None, None
-
-    # ──────────────────────────────────────────
-    # カード検索
-    # ──────────────────────────────────────────
-
-    def _find_cards(self, soup: BeautifulSoup) -> list:
-        """ページ内の店舗カード要素を探す"""
-        selectors = [
-            # 現行HTML（エリアページ）
-            "div.cassetteRestaurant",
-            "li.cassetteRestaurant",
-            "article.cassetteRestaurant",
-            # 旧HTML
-            "div.shopDetailInfo",
-            "section.shopDetail",
-            "div.rstCassette",
-            "li.shopListItem",
-            # 汎用
-            "div.list-cassette__item",
-            "li.list-item",
-            "div[class*='cassette']",
-            "li[class*='cassette']",
-        ]
-        for sel in selectors:
-            cards = soup.select(sel)
-            if cards:
-                logger.debug(f"[ホットペッパー] カードセレクタ: {sel} ({len(cards)}件)")
-                return cards
-        return []
-
-    # ──────────────────────────────────────────
-    # カード解析
-    # ──────────────────────────────────────────
-
-    def _parse_card(self, card, station_name: str, base_url: str) -> Restaurant | None:
-        """カード要素から Restaurant を生成する"""
+    def _parse_card(self, card, station_name: str) -> Restaurant | None:
         # 店名・URL
-        name_tag = (
-            card.select_one("h3 a") or
-            card.select_one("h2 a") or
-            card.select_one("p.cassetteRestaurant__name a") or
-            card.select_one("a[href*='/str']") or
-            card.select_one("a.shopDetailInfoTitle") or
-            card.select_one("a[href*='hotpepper']")
-        )
+        name_tag = card.select_one("h3.shopDetailStoreName a")
         if not name_tag:
             return None
         name = name_tag.get_text(strip=True)
@@ -177,37 +101,20 @@ class HotPepperScraper(BaseScraper):
             return None
         url = href if href.startswith("http") else urljoin(BASE, href)
 
-        # ジャンル
-        genre_tag = (
-            card.select_one("p.cassetteRestaurant__type") or
-            card.select_one("span.cassetteRestaurant__categoryItem") or
-            card.select_one("p.shopDetailInfoCatch") or
-            card.select_one("span.shopCategory") or
-            card.select_one("[class*='category']") or
-            card.select_one("[class*='genre']")
-        )
-        genre = genre_tag.get_text(strip=True) if genre_tag else ""
+        # ジャンル: "韓国料理｜東通り" → "韓国料理" だけ取り出す
+        genre_tag = card.select_one("p.parentGenreName")
+        genre = genre_tag.get_text(strip=True).split("｜")[0] if genre_tag else ""
 
-        # 住所
-        addr_tag = (
-            card.select_one("p.cassetteRestaurant__address") or
-            card.select_one("p.shopAddress") or
-            card.select_one("span[itemprop='streetAddress']") or
-            card.select_one("[class*='address']")
-        )
-        address = addr_tag.get_text(strip=True) if addr_tag else ""
+        # アクセス情報（住所代わり）
+        access_tag = card.select_one("li.shopDetailInfoAccess")
+        address = access_tag.get("title") or access_tag.get_text(strip=True) if access_tag else ""
 
-        # 予算
-        budget_tag = (
-            card.select_one("p.cassetteRestaurant__price") or
-            card.select_one("span.cassetteRestaurant__priceNum") or
-            card.select_one("[class*='budget']") or
-            card.select_one("[class*='price']")
-        )
+        # 予算（ディナー）: "2001～3000円" → 3000
+        budget_tag = card.select_one("div.storeBudgetAverage p.dinnerBudget")
         budget_text = budget_tag.get_text(strip=True) if budget_tag else ""
         budget = self._parse_budget(budget_text)
 
-        # テキスト全体から席数・設備を取得
+        # キャッチコピーとアイコンリストから設備情報を取得
         full_text = card.get_text(" ", strip=True)
         seats_match = re.search(r"(\d+)\s*席", full_text)
         seats = int(seats_match.group(1)) if seats_match else 0
@@ -230,10 +137,9 @@ class HotPepperScraper(BaseScraper):
         )
 
     def _has_next_page(self, soup: BeautifulSoup) -> bool:
-        next_link = (
+        return bool(
             soup.select_one("a.next") or
             soup.select_one("li.next a") or
             soup.select_one("a[rel='next']") or
-            soup.select_one("a[class*='next']")
+            soup.select_one("p.pagination-parts a.current + a")
         )
-        return next_link is not None
