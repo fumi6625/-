@@ -71,11 +71,14 @@ class BaseScraper(ABC):
 
     @staticmethod
     def dedup(restaurants: list[Restaurant]) -> list[Restaurant]:
-        """店名＋住所先頭20文字で重複を排除する"""
+        """URLで重複を排除する（URLなしの場合は店名＋住所先頭20文字）"""
         seen: set = set()
         result: list[Restaurant] = []
         for r in restaurants:
-            key = (r.name.strip(), r.address[:20].strip())
+            if r.url:
+                key = r.url.rstrip("/")
+            else:
+                key = (r.name.strip(), r.address[:20].strip())
             if key not in seen:
                 seen.add(key)
                 result.append(r)

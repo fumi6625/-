@@ -106,14 +106,20 @@ class HotPepperScraper(BaseScraper):
                     allow_redirects=True,
                 )
                 rotate_ua(self._session)
+                logger.debug(f"HP URL試行: {url} → {resp.status_code} ({len(resp.text)}chars) final={resp.url}")
                 if resp.status_code == 200 and len(resp.text) > 1000:
                     soup = BeautifulSoup(resp.text, "lxml")
                     # 404ページや空ページを除外
                     if "存在しません" in resp.text or "not found" in resp.text.lower():
+                        logger.debug(f"HP: 存在しませんページ → スキップ {url}")
                         continue
+                    cards = self._find_cards(soup)
+                    logger.info(f"[ホットペッパー] {url} → {len(cards)}件のカード")
                     return soup, resp.url
+                else:
+                    logger.debug(f"HP: 無効レスポンス status={resp.status_code} len={len(resp.text)} → {url}")
             except Exception as e:
-                logger.debug(f"URL試行失敗 {url}: {e}")
+                logger.info(f"[ホットペッパー] URL試行失敗 {url}: {e}")
                 continue
 
         logger.warning(f"[ホットペッパー] エリア {area_code} p{page}: 取得失敗")
