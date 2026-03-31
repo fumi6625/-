@@ -1,38 +1,34 @@
 """
-デバッグスクリプト: 実際に取得できるHTMLを確認する
+デバッグスクリプト v2: 実際に取得できるHTMLを確認する
 実行: python3 debug_scrapers.py
 """
 import sys
-import subprocess
+import re
 
 # ── undetected_chromedriver のインポート確認 ──────────────────────
 print("=" * 60)
-print("① undetected_chromedriver インポート確認")
+print("① パッケージ確認")
 print("=" * 60)
 try:
     import undetected_chromedriver as uc
     print("✓ undetected_chromedriver OK")
 except ImportError as e:
-    print(f"✗ エラー: {e}")
-    print("→ 実行: pip3 install undetected-chromedriver selenium")
+    print(f"✗ undetected_chromedriver: {e}")
+    if "distutils" in str(e):
+        print("→ 修正方法: pip3 install setuptools")
+    else:
+        print("→ 修正方法: pip3 install undetected-chromedriver")
 
 try:
     from selenium.webdriver.common.by import By
     print("✓ selenium OK")
-except ImportError as e:
-    print(f"✗ selenium エラー: {e}")
-    print("→ 実行: pip3 install selenium")
-
-# ── ホットペッパー HTML 確認 ──────────────────────────────────────
-print()
-print("=" * 60)
-print("② ホットペッパー HTML 確認")
-print("=" * 60)
+except ImportError:
+    print("✗ selenium → pip3 install selenium")
 
 import requests
 from bs4 import BeautifulSoup
 
-headers = {
+HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) "
                   "Chrome/124.0.0.0 Safari/537.36",
@@ -40,78 +36,71 @@ headers = {
     "Referer": "https://www.hotpepper.jp/",
 }
 
-# 梅田周辺で検索
-url = "https://www.hotpepper.jp/SS010101/?SVC=0&keyword=%E6%A2%85%E7%94%B0&budget=B008&PG=1"
-print(f"URL: {url}")
-resp = requests.get(url, headers=headers, timeout=20, allow_redirects=True)
-print(f"ステータスコード: {resp.status_code}")
-print(f"最終URL: {resp.url}")
-print(f"レスポンスサイズ: {len(resp.text)} 文字")
-
-soup = BeautifulSoup(resp.text, "lxml")
-print(f"ページタイトル: {soup.title.string if soup.title else 'なし'}")
-
-# 様々なセレクタを試す
-selectors_to_try = [
-    "div.shopDetailInfo",
-    "section.shopDetail",
-    "div.rstCassette",
-    "li.shopListItem",
-    "div.cassetteRestaurant",
-    "div.list-cassette",
-    "article.list-cassette__item",
-    "div.cst",
-    "li.cst",
-    "div.resListItem",
-    "div.shopLineArea",
-    "div[class*='shop']",
-    "div[class*='restaurant']",
-    "div[class*='list']",
-]
-
-print("\n--- セレクタ検索結果 ---")
-found = False
-for sel in selectors_to_try:
-    items = soup.select(sel)
-    if items:
-        print(f"✓ {sel}: {len(items)}件")
-        found = True
-
-if not found:
-    print("✗ 既知のセレクタでは見つかりませんでした")
-    print("\n--- HTMLの最初の500文字 ---")
-    print(resp.text[:500])
-    print("\n--- bodyタグ内のclass一覧（上位20個）---")
-    classes = set()
-    for tag in soup.find_all(class_=True)[:100]:
-        for c in tag.get("class", []):
-            classes.add(c)
-    for c in sorted(classes)[:20]:
-        print(f"  .{c}")
-
-# ── 食べログ URL 確認 ─────────────────────────────────────────────
+# ── ホットペッパー 複数URL試行 ────────────────────────────────────
 print()
 print("=" * 60)
-print("③ 食べログ URL 確認（HTMLのみ、Seleniumなし）")
+print("② ホットペッパー URL確認")
+print("=" * 60)
+
+hp_urls = [
+    "https://www.hotpepper.jp/SA11/sk梅田/",
+    "https://www.hotpepper.jp/SA11/",
+    "https://www.hotpepper.jp/s1/",
+    "https://www.hotpepper.jp/",
+]
+
+for url in hp_urls:
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=15, allow_redirects=True)
+        soup = BeautifulSoup(resp.text, "lxml")
+        title = soup.title.string[:50] if soup.title else "なし"
+        # カード候補を探す
+        card_count = 0
+        card_selector = ""
+        for sel in ["div.cassetteRestaurant", "li.cassetteRestaurant",
+                    "div.shopDetailInfo", "div.rstCassette", "article"]:
+            c = soup.select(sel)
+            if c:
+                card_count = len(c)
+                card_selector = sel
+                break
+        print(f"[{resp.status_code}] {url[:60]}")
+        print(f"  タイトル: {title}")
+        print(f"  カード: {card_count}件 ({card_selector})")
+        if card_count > 0:
+            print(f"  → このURLが使えます！")
+            # 最初のカードのHTML構造を表示
+            first = soup.select(card_selector)[0]
+            links = [a['href'] for a in first.select("a[href]")[:2]]
+            print(f"  リンク例: {links}")
+            break
+    except Exception as e:
+        print(f"  エラー: {e}")
+
+# ── 食べログ 確認 ─────────────────────────────────────────────────
+print()
+print("=" * 60)
+print("③ 食べログ確認（requests で20件取得できるか）")
 print("=" * 60)
 
 url_tb = ("https://tabelog.com/osaka/rstLst/?"
           "vs=1&lat=34.7025&lon=135.4959&dist=0.5&price_max=6000&p=1")
-print(f"URL: {url_tb}")
-try:
-    resp_tb = requests.get(url_tb, headers=headers, timeout=20, allow_redirects=True)
-    print(f"ステータスコード: {resp_tb.status_code}")
-    print(f"最終URL: {resp_tb.url}")
-    soup_tb = BeautifulSoup(resp_tb.text, "lxml")
-    print(f"ページタイトル: {soup_tb.title.string[:60] if soup_tb.title else 'なし'}")
-    cards = soup_tb.select("div.list-rst__wrap")
-    print(f"div.list-rst__wrap: {len(cards)}件")
-    if len(cards) == 0:
-        print("（Cloudflareでブロックされている可能性があります）")
-except Exception as e:
-    print(f"エラー: {e}")
+HEADERS["Referer"] = "https://tabelog.com/"
+resp_tb = requests.get(url_tb, headers=HEADERS, timeout=20)
+soup_tb = BeautifulSoup(resp_tb.text, "lxml")
+cards = soup_tb.select("div.list-rst__wrap")
+print(f"ステータス: {resp_tb.status_code}")
+print(f"カード数: {len(cards)}件")
+if cards:
+    first = cards[0]
+    name = first.select_one("a.list-rst__rst-name-target")
+    genre = first.select_one("span.list-rst__category-main-name")
+    budget = first.select_one("span.c-rating-v2__val--dinner")
+    print(f"  1件目 店名: {name.get_text(strip=True) if name else '?'}")
+    print(f"  1件目 ジャンル: {genre.get_text(strip=True) if genre else '?'}")
+    print(f"  1件目 予算: {budget.get_text(strip=True) if budget else '?'}")
 
 print()
 print("=" * 60)
-print("デバッグ完了。この出力を貼り付けてください。")
+print("デバッグ完了")
 print("=" * 60)
