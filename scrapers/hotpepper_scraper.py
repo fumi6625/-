@@ -2,36 +2,22 @@
 ホットペッパーグルメ スクレイパー
 
 requests + BeautifulSoup を使用。
-駅名でキーワード検索 → 一覧取得 → 詳細取得。
+駅のエリアコード（SA23/Y***）でエリア検索 → 一覧取得。
 """
 import re
 import logging
-from urllib.parse import urljoin, quote
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
 from scrapers.base_scraper import BaseScraper
 from models.restaurant import Restaurant
-from config.settings import MAX_BUDGET, SEARCH_RADIUS_KM
+from config.settings import MAX_BUDGET, HP_STATION_AREA
 from utils.http import make_session, get_with_retry, rotate_ua
 
 logger = logging.getLogger(__name__)
 
 BASE = "https://www.hotpepper.jp"
-
-# 予算上限6000円以下に対応するコード群
-# B006=3001-4000, B007=4001-5000, B008=5001-7000（6000円以内を後でフィルタ）
-BUDGET_CODES = ["B006", "B007", "B008"]
-
-# 検索URL候補（順番に試す）
-SEARCH_URL_TEMPLATES = [
-    # パターン1: エリア＋キーワード検索
-    BASE + "/SA11/sk{keyword}/",
-    # パターン2: キーワードのみ
-    BASE + "/Saccess0EntranceAction.do?sk={keyword}&sa=&rsc=0&vn=1",
-    # パターン3: 旧形式フォールバック
-    BASE + "/yoyaku/rstSearchTop.do?freeword={keyword}&BUGET=B008&PG={page}",
-]
 
 
 class HotPepperScraper(BaseScraper):
@@ -41,6 +27,8 @@ class HotPepperScraper(BaseScraper):
         self._session = make_session()
         self._session.headers.update({
             "Referer": BASE + "/",
+            "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         })
 
     # ──────────────────────────────────────────
@@ -49,18 +37,19 @@ class HotPepperScraper(BaseScraper):
 
     def search(self, station_name: str, lat: float, lon: float) -> list[Restaurant]:
         results: list[Restaurant] = []
-        # 駅名から「駅」を除去（例: 梅田駅 → 梅田）
-        keyword = station_name.replace("駅", "")
-        encoded = quote(keyword, safe="")
+
+        area_code = HP_STATION_AREA.get(station_name)
+        if not area_code:
+            logger.warning(f"[ホットペッパー] エリアコード未設定: {station_name}")
+            return results
 
         max_pages = 2 if self.dry_run else 50
 
         for page in range(1, max_pages + 1):
-            soup, final_url = self._fetch_search_page(encoded, page)
+            soup, final_url = self._fetch_search_page(area_code, page)
             if soup is None:
                 break
 
-            # 複数のカードセレクタを試す
             cards = self._find_cards(soup)
             if not cards:
                 logger.info(f"[ホットペッパー] {station_name}: 結果なし（p{page}）")
@@ -73,7 +62,7 @@ class HotPepperScraper(BaseScraper):
                     restaurant = self._parse_card(card, station_name, final_url)
                     if not restaurant:
                         continue
-                    # 予算フィルタ
+                    # 予算フィルタ（0=未取得は除外しない）
                     if 0 < restaurant.budget > MAX_BUDGET:
                         continue
                     results.append(restaurant)
@@ -91,19 +80,25 @@ class HotPepperScraper(BaseScraper):
     # ページ取得
     # ──────────────────────────────────────────
 
-    def _fetch_search_page(self, encoded_keyword: str, page: int):
-        """複数のURL形式を試してページを取得する"""
+    def _fetch_search_page(self, area_code: str, page: int):
+        """エリアコードを使って検索ページを取得する"""
+        # page 1 は bgn1 なし、page 2 以降は bgn{(page-1)*20+1}
+        bgn = "" if page == 1 else f"bgn{(page - 1) * 20 + 1}/"
+
         urls_to_try = [
-            # 現行の主要URL形式
-            f"{BASE}/SA11/sk{encoded_keyword}/",
-            f"{BASE}/SA11/sk{encoded_keyword}/bgn{(page-1)*20+1}/",
-            # 別形式
-            f"{BASE}/Saccess0EntranceAction.do?sk={encoded_keyword}&rsc=0&vn=1&start={page}",
-            # フリーワード検索
-            f"{BASE}/rstSearch/keyword={encoded_keyword}/page={page}/",
+            f"{BASE}/{area_code}/{bgn}",
+            f"{BASE}/{area_code}/bgn{(page-1)*20+1}/",
         ]
 
-        for url in urls_to_try:
+        # 重複除去
+        seen = set()
+        deduped = []
+        for u in urls_to_try:
+            if u not in seen:
+                seen.add(u)
+                deduped.append(u)
+
+        for url in deduped:
             try:
                 resp = get_with_retry(
                     self._session, url,
@@ -121,7 +116,7 @@ class HotPepperScraper(BaseScraper):
                 logger.debug(f"URL試行失敗 {url}: {e}")
                 continue
 
-        logger.warning(f"[ホットペッパー] すべてのURL形式が失敗")
+        logger.warning(f"[ホットペッパー] エリア {area_code} p{page}: 取得失敗")
         return None, None
 
     # ──────────────────────────────────────────
@@ -131,7 +126,7 @@ class HotPepperScraper(BaseScraper):
     def _find_cards(self, soup: BeautifulSoup) -> list:
         """ページ内の店舗カード要素を探す"""
         selectors = [
-            # 現行HTML
+            # 現行HTML（エリアページ）
             "div.cassetteRestaurant",
             "li.cassetteRestaurant",
             "article.cassetteRestaurant",
@@ -149,6 +144,7 @@ class HotPepperScraper(BaseScraper):
         for sel in selectors:
             cards = soup.select(sel)
             if cards:
+                logger.debug(f"[ホットペッパー] カードセレクタ: {sel} ({len(cards)}件)")
                 return cards
         return []
 
@@ -164,6 +160,7 @@ class HotPepperScraper(BaseScraper):
             card.select_one("h2 a") or
             card.select_one("p.cassetteRestaurant__name a") or
             card.select_one("a[href*='/str']") or
+            card.select_one("a.shopDetailInfoTitle") or
             card.select_one("a[href*='hotpepper']")
         )
         if not name_tag:
@@ -231,6 +228,6 @@ class HotPepperScraper(BaseScraper):
             soup.select_one("a.next") or
             soup.select_one("li.next a") or
             soup.select_one("a[rel='next']") or
-            soup.select_one("[class*='next']")
+            soup.select_one("a[class*='next']")
         )
         return next_link is not None
